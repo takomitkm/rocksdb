@@ -1,0 +1,105 @@
+name: e26-rocksdb-cost
+
+# E26e: real RocksDB, three WinDirectory::Fsync variants, dir-sync cost via
+# db_bench fillrandom with a small write buffer (every memtable flush creates
+# an SST and syncs its directory; manifest edits sync too).
+#   base    = meta/rocksdb 96cf38d4 (upstream main, WinDirectory::Fsync no-op)
+#   dironly = takomitkm/rocksdb 56cd0059 (PR #15682 commit 1)
+#   dirroot = takomitkm/rocksdb ed8b043a (PR #15682 head, + volume-root flush)
+
+on:
+  push:
+    branches: [bench-e26]
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: windows-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - name: base
+            repo: meta/rocksdb
+            ref: 96cf38d445b185f13a28f7018d16229d5946fbad
+          - name: dironly
+            repo: takomitkm/rocksdb
+            ref: 56cd00595b5dbe237bd67413c8c8e27f66d25058
+          - name: dirroot
+            repo: takomitkm/rocksdb
+            ref: ed8b043a407f2cda6e631c066a3890721ceb0d7c
+    steps:
+      - name: checkout ${{ matrix.variant.name }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.variant.repo }}
+          ref: ${{ matrix.variant.ref }}
+
+      - name: install gflags (vcpkg, preinstalled on runners)
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install gflags:x64-windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: stage gflags in the layout thirdparty.inc expects (env-driven)
+        shell: pwsh
+        run: |
+          $vp = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
+          $stage = "$env:RUNNER_TEMP\gflags-stage"
+          New-Item -ItemType Directory -Force -Path "$stage\lib\native\retail\amd64" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$stage\build\native\include" | Out-Null
+          Copy-Item "$vp\lib\gflags.lib" "$stage\lib\native\retail\amd64\gflags.lib"
+          Copy-Item "$vp\include\gflags" "$stage\build\native\include\gflags" -Recurse
+          $env:GFLAGS_INCLUDE = "$stage\build\native\include"
+          $env:GFLAGS_LIB_RELEASE = "$stage\lib\native\retail\amd64\gflags.lib"
+          "GFLAGS_INCLUDE=$($env:GFLAGS_INCLUDE)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "GFLAGS_LIB_RELEASE=$($env:GFLAGS_LIB_RELEASE)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "staged: include=$($env:GFLAGS_INCLUDE) lib=$($env:GFLAGS_LIB_RELEASE)"
+
+      - name: configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build -A x64 `
+            -DWITH_GFLAGS=1 `
+            -DWITH_SNAPPY=0 -DWITH_ZLIB=0 -DWITH_LZ4=0 `
+            -DWITH_ZSTD=0 -DWITH_BZ2=0 -DWITH_TESTS=0 -DWITH_BENCHMARK_TOOLS=1 `
+            -DWITH_TOOLS=0 -DWITH_TRACE_TOOLS=0 -DWITH_CORE_TOOLS=0 `
+            -DWITH_EXAMPLES=0 -DWITH_WINDOWS_UTF8_FILENAMES=0 `
+            -DWARNINGS_AS_ERRORS=0 -DCMAKE_CXX_FLAGS="/wd4723 /wd4244"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: build db_bench
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --target db_bench -- /m
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: diagnose db_bench (no output yet - capture everything)
+        shell: pwsh
+        run: |
+          $exe = 'build\Release\db_bench.exe'
+          if (-not (Test-Path $exe)) { $exe = (Get-ChildItem -Recurse -Filter db_bench.exe | Select-Object -First 1).FullName }
+          Copy-Item (Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows\bin\gflags.dll') 'build\Release' -ErrorAction SilentlyContinue
+          Write-Host "exe size: $((Get-Item $exe).Length) bytes"
+          Write-Host '--- --help output:'
+          (& $exe --help 2>&1 | Out-String) | Write-Host
+          Write-Host "help exit: $LASTEXITCODE"
+          Write-Host '--- minimal fillseq run:'
+          $out = & $exe --benchmarks=fillseq --num=1000 --compression_type=none --db="D:\e26diag" 2>&1
+          $out | Write-Host
+          Write-Host "fillseq exit: $LASTEXITCODE"
+
+      - name: bench - fillrandom 40 MiB with 128 KiB buffer, 2 rounds
+        shell: pwsh
+        run: |
+          $exe = 'build\Release\db_bench.exe'
+          if (-not (Test-Path $exe)) { $exe = (Get-ChildItem -Recurse -Filter db_bench.exe | Select-Object -First 1).FullName }
+          Copy-Item (Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows\bin\gflags.dll') 'build\Release' -ErrorAction SilentlyContinue
+          Write-Host "db_bench: $exe"
+          foreach ($r in 1..2) {
+            $out = & $exe --benchmarks=fillrandom --num=400000 --write_buffer_size=131072 `
+              --disable_auto_compactions=1 --compression_type=none --db="D:\e26rock-$($r)" 2>&1
+            $out | Write-Host
+            Write-Host "round $r exit: $LASTEXITCODE"
+          }
